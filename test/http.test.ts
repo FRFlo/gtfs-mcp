@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import type { Server } from "node:http";
+import { request as httpRequest, type Server } from "node:http";
 import {
   setupTestDb,
   cleanupTestDb,
@@ -80,10 +80,10 @@ beforeAll(async () => {
     return new Response(body, { status: 200 });
   });
 
-  httpServer = createHttpMcpServer(testConfig);
+  ({ httpServer } = createHttpMcpServer(testConfig));
 
   await new Promise<void>((resolve) => {
-    httpServer.listen(0, () => resolve());
+    httpServer.listen(0, "127.0.0.1", () => resolve());
   });
   const addr = httpServer.address();
   port = typeof addr === "object" && addr ? addr.port : 0;
@@ -197,5 +197,71 @@ describe("HTTP transport", () => {
       const res = await fetch(`http://localhost:${port}/mcp`, { method, headers, body });
       expect(res.status).toBe(status);
     });
+  });
+
+  describe("endpoint routing", () => {
+    it.each(["/", "/foo", "/mcp/extra"])("404 for path %s", async (path) => {
+      const res = await fetch(`http://localhost:${port}${path}`);
+      expect(res.status).toBe(404);
+    });
+
+    it("405 for unsupported methods", async () => {
+      const res = await fetch(`http://localhost:${port}/mcp`, { method: "PUT" });
+      expect(res.status).toBe(405);
+    });
+  });
+
+  describe("DNS rebinding protection", () => {
+    it("403 for disallowed Origin", async () => {
+      const res = await fetch(`http://localhost:${port}/mcp`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+          origin: "http://evil.example.com",
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+      });
+      expect(res.status).toBe(403);
+    });
+
+    it("403 for disallowed Host", async () => {
+      // Use raw http.request because fetch/undici locks the Host header.
+      const status = await new Promise<number>((resolve, reject) => {
+        const req = httpRequest(
+          {
+            hostname: "127.0.0.1",
+            port,
+            path: "/mcp",
+            method: "POST",
+            headers: {
+              host: "evil.example.com",
+              "content-type": "application/json",
+              accept: "application/json, text/event-stream",
+            },
+          },
+          (res) => {
+            res.resume();
+            resolve(res.statusCode ?? 0);
+          },
+        );
+        req.on("error", reject);
+        req.end(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }));
+      });
+      expect(status).toBe(403);
+    });
+  });
+
+  it("413 for oversized body", async () => {
+    const big = "x".repeat(5 * 1024 * 1024);
+    const res = await fetch(`http://localhost:${port}/mcp`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+      },
+      body: big,
+    });
+    expect(res.status).toBe(413);
   });
 });
